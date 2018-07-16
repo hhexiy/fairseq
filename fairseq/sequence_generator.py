@@ -6,11 +6,14 @@
 # can be found in the PATENTS file in the same directory.
 
 import math
+import numpy as np
 
 import torch
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter
 
 from fairseq import utils
-from fairseq.models import FairseqIncrementalDecoder
+from fairseq.models import FairseqIncrementalDecoder, FairseqLanguageModel
 
 
 class SequenceGenerator(object):
@@ -18,6 +21,7 @@ class SequenceGenerator(object):
         self, models, tgt_dict, beam_size=1, minlen=1, maxlen=None, stop_early=True,
         normalize_scores=True, len_penalty=1, unk_penalty=0, retain_dropout=False,
         sampling=False, sampling_topk=-1, sampling_temperature=1,
+        lm=None, lm_dict=None,
     ):
         """Generates translations of a given source sentence.
         Args:
@@ -46,6 +50,19 @@ class SequenceGenerator(object):
         self.sampling = sampling
         self.sampling_topk = sampling_topk
         self.sampling_temperature = sampling_temperature
+        self.lm = lm
+        if lm:
+            self.lm_dict = lm_dict
+            self.lm_dict_map = self.get_dict_map(lm_dict, tgt_dict)
+            self.models.append(lm)
+            new_weight = lm.decoder.embed_tokens.weight[self.lm_dict_map, :]
+            lm.decoder.embed_tokens.weight = Parameter(new_weight)
+
+    def get_dict_map(self, src_dict, tgt_dict):
+        dict_map = []
+        for idx in range(len(tgt_dict)):
+            dict_map.append(src_dict.index(tgt_dict[idx]))
+        return dict_map
 
     def cuda(self):
         for model in self.models:
@@ -114,11 +131,14 @@ class SequenceGenerator(object):
                 incremental_states[model] = None
 
             # compute the encoder output for each beam
-            encoder_out = model.encoder(
-                src_tokens.repeat(1, beam_size).view(-1, srclen),
-                src_lengths.expand(beam_size, src_lengths.numel()).t().contiguous().view(-1),
-            )
-            encoder_outs.append(encoder_out)
+            if hasattr(model, 'encoder'):
+                encoder_out = model.encoder(
+                    src_tokens.repeat(1, beam_size).view(-1, srclen),
+                    src_lengths.expand(beam_size, src_lengths.numel()).t().contiguous().view(-1),
+                )
+                encoder_outs.append(encoder_out)
+            else:
+                encoder_outs.append(None)
 
         # initialize buffers
         scores = src_tokens.data.new(bsz * beam_size, maxlen + 1).float().fill_(0)
@@ -268,7 +288,8 @@ class SequenceGenerator(object):
                 for i, model in enumerate(self.models):
                     if isinstance(model.decoder, FairseqIncrementalDecoder):
                         model.decoder.reorder_incremental_state(incremental_states[model], reorder_state)
-                    encoder_outs[i] = model.encoder.reorder_encoder_out(encoder_outs[i], reorder_state)
+                    if hasattr(model, 'encoder'):
+                        encoder_outs[i] = model.encoder.reorder_encoder_out(encoder_outs[i], reorder_state)
 
             probs, avg_attn_scores = self._decode(
                 tokens[:, :step + 1], encoder_outs, incremental_states)
@@ -498,8 +519,9 @@ class SequenceGenerator(object):
 
         avg_probs = None
         avg_attn = None
-        for model, encoder_out in zip(self.models, encoder_outs):
+        for model, encoder_out, w in zip(self.models, encoder_outs, [0.5, 0.5]):
             probs, attn = self._decode_one(tokens, model, encoder_out, incremental_states, log_probs=False)
+            probs = w * probs
             if avg_probs is None:
                 avg_probs = probs
             else:
@@ -509,21 +531,30 @@ class SequenceGenerator(object):
                     avg_attn = attn
                 else:
                     avg_attn.add_(attn)
-        avg_probs.div_(len(self.models))
+        #avg_probs.div_(len(self.models))
         avg_probs.log_()
         if avg_attn is not None:
             avg_attn.div_(len(self.models))
         return avg_probs, avg_attn
 
     def _decode_one(self, tokens, model, encoder_out, incremental_states, log_probs):
+        if isinstance(model, FairseqLanguageModel):
+            encoder_out = None
         with torch.no_grad():
             if incremental_states[model] is not None:
                 decoder_out = list(model.decoder(tokens, encoder_out, incremental_states[model]))
             else:
                 decoder_out = list(model.decoder(tokens, encoder_out))
-            decoder_out[0] = decoder_out[0][:, -1, :]
             attn = decoder_out[1]
             if attn is not None:
                 attn = attn[:, -1, :]
-        probs = model.get_normalized_probs(decoder_out, log_probs=log_probs)
+        if isinstance(model, FairseqLanguageModel):
+            batch_size = decoder_out[0].shape[0]
+            dict_map = torch.tensor(self.lm_dict_map, dtype=torch.int32)
+            probs = model.get_normalized_probs(decoder_out, log_probs=True, sample=None)
+            probs = probs[:, -1, :]
+            probs = F.softmax(probs[:, self.lm_dict_map], dim=1)
+        else:
+            decoder_out[0] = decoder_out[0][:, -1, :]  # (B, C)
+            probs = model.get_normalized_probs(decoder_out, log_probs=log_probs)
         return probs, attn
