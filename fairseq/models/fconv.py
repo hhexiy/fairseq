@@ -399,6 +399,9 @@ class FConvDecoder(FairseqIncrementalDecoder):
             in_channels = out_channels
             layer_in_channels.append(out_channels)
 
+        self._last_out_channels = in_channels
+        self._out_embed_dim = out_embed_dim
+
         self.adaptive_softmax = None
         self.fc2 = self.fc3 = None
 
@@ -416,6 +419,24 @@ class FConvDecoder(FairseqIncrementalDecoder):
                 self.fc3.weight = self.embed_tokens.weight
             else:
                 self.fc3 = Linear(out_embed_dim, num_embeddings, dropout=dropout)
+
+    @property
+    def output_size(self):
+        if self.adaptive_softmax is not None:
+            return self._last_out_channels
+        else:
+            return self._out_embed_dim
+
+    def disable_output_layer(self):
+        if self.adaptive_softmax is not None:
+            for param in self.adaptive_softmax.parameters():
+                param.requires_grad = False
+        else:
+            for param in self.fc2.parameters():
+                param.requires_grad = False
+            for param in self.fc3.parameters():
+                param.requires_grad = False
+
 
     def forward(self, prev_output_tokens, encoder_out_dict=None, incremental_state=None):
         if encoder_out_dict is not None:
@@ -481,21 +502,26 @@ class FConvDecoder(FairseqIncrementalDecoder):
 
         # T x B x C -> B x T x C
         x = self._transpose_if_training(x, incremental_state)
+        outputs = x
 
         # project back to size of vocabulary if not using adaptive softmax
         if self.fc2 is not None and self.fc3 is not None:
             x = self.fc2(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
+            outputs = x
             x = self.fc3(x)
 
-        return x, avg_attn_scores
+        return x, avg_attn_scores, outputs
 
     def get_normalized_probs(self, net_output, log_probs, sample):
         """Get normalized probabilities (or log probs) from a net's output."""
 
         if self.adaptive_softmax is not None:
-            assert sample is not None and 'target' in sample
-            out = self.adaptive_softmax.get_log_prob(net_output[0], sample['target'])
+            if sample is None:
+                out = self.adaptive_softmax.get_log_prob(net_output[0], None)
+            else:
+                assert sample is not None and 'target' in sample
+                out = self.adaptive_softmax.get_log_prob(net_output[0], sample['target'])
             return out.exp_() if not log_probs else out
         else:
             return super().get_normalized_probs(net_output, log_probs, sample)
@@ -512,14 +538,15 @@ class FConvDecoder(FairseqIncrementalDecoder):
         return self.embed_positions.max_positions() if self.embed_positions is not None else float('inf')
 
     def upgrade_state_dict(self, state_dict):
-        if state_dict.get('decoder.version', torch.Tensor([1]))[0] < 2:
-            # old models use incorrect weight norm dimension
-            for i, conv in enumerate(self.convolutions):
-                # reconfigure weight norm
-                nn.utils.remove_weight_norm(conv)
-                self.convolutions[i] = nn.utils.weight_norm(conv, dim=0)
-            state_dict['decoder.version'] = torch.Tensor([1])
         return state_dict
+        #if state_dict.get('decoder.version', torch.Tensor([1]))[0] < 2:
+        #    # old models use incorrect weight norm dimension
+        #    for i, conv in enumerate(self.convolutions):
+        #        # reconfigure weight norm
+        #        nn.utils.remove_weight_norm(conv)
+        #        self.convolutions[i] = nn.utils.weight_norm(conv, dim=0)
+        #    state_dict['decoder.version'] = torch.Tensor([2])
+        #return state_dict
 
     def _embed_tokens(self, tokens, incremental_state):
         if incremental_state is not None:

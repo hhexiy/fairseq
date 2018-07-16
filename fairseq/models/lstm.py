@@ -5,15 +5,19 @@
 # the root directory of this source tree. An additional grant of patent rights
 # can be found in the PATENTS file in the same directory.
 
+import copy
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parameter import Parameter
 
-from fairseq import options, utils
+from fairseq import options, utils, tasks
 
 from . import (
     FairseqEncoder, FairseqIncrementalDecoder, FairseqModel, register_model,
-    register_model_architecture,
+    register_model_architecture
 )
 
 
@@ -60,6 +64,13 @@ class LSTMModel(FairseqModel):
         parser.add_argument('--decoder-dropout-out', type=float, metavar='D',
                             help='dropout probability for decoder output')
 
+        parser.add_argument('--pretrained-lm', default=None, type=str, metavar='STR',
+                            help='path to pre-trained language model')
+        parser.add_argument('--fusion-type', default='output', choices=['output', 'input', 'prob'],
+                            help='where to fuse pretrained models')
+        parser.add_argument('--mixing-weights', default=None, type=str,
+                            help='mixing weights (probability) of the models')
+
     @classmethod
     def build_model(cls, args, task):
         """Build a new model instance."""
@@ -83,6 +94,18 @@ class LSTMModel(FairseqModel):
             pretrained_decoder_embed = load_pretrained_embedding_from_file(
                 args.decoder_embed_path, task.target_dictionary, args.decoder_embed_dim)
 
+        additional_input_size = 0
+        if args.pretrained_lm:
+            lm_args = copy.copy(args)
+            setattr(lm_args, 'task', 'language_modeling')
+            # For loading vocab
+            setattr(lm_args, 'data', os.path.dirname(args.pretrained_lm))
+            lm_task = tasks.setup_task(lm_args)
+            print('| loading pretrained LM from {}'.format(args.pretrained_lm))
+            lm = utils.load_ensemble_for_inference([args.pretrained_lm], lm_task)[0][0]
+            if args.fusion_type == 'input':
+                additional_input_size = lm.decoder.output_size
+
         encoder = LSTMEncoder(
             dictionary=task.source_dictionary,
             embed_dim=args.encoder_embed_dim,
@@ -105,7 +128,34 @@ class LSTMModel(FairseqModel):
             encoder_embed_dim=args.encoder_embed_dim,
             encoder_output_units=encoder.output_units,
             pretrained_embed=pretrained_decoder_embed,
+            additional_input_size=additional_input_size,
         )
+
+        if args.pretrained_lm:
+            decoders = [decoder, lm.decoder]
+            trainable = [True, False]
+            conditional = [True, False]
+
+            if args.fusion_type == 'input':
+                for decoder in decoders[1:]:
+                    decoder.disable_output_layer()
+            elif args.fusion_type == 'output':
+                for decoder in decoders:
+                    decoder.disable_output_layer()
+
+            if args.fusion_type == 'prob':
+                if args.mixing_weights is not None and args.mixing_weights != 'learned':
+                    mixing_weights = eval(args.mixing_weights)
+                    assert isinstance(mixing_weights, list)
+                    assert sum(mixing_weights) == 1, 'Mixing weights do not sum to 1: {}'.format(mixing_weights)
+                else:
+                    mixing_weights = args.mixing_weights
+            else:
+                mixing_weights = None
+
+            decoder = MultiDecoder(decoders, trainable, conditional,
+                    fusion_type=args.fusion_type, mixing_weights=mixing_weights)
+
         return cls(encoder, decoder)
 
 
@@ -244,6 +294,125 @@ class AttentionLayer(nn.Module):
         x = F.tanh(self.output_proj(torch.cat((x, input), dim=1)))
         return x, attn_scores
 
+class MultiDecoder(FairseqIncrementalDecoder):
+    def __init__(self, decoders, trainable, conditional, fusion_type='prob', mixing_weights=None):
+        assert len(decoders) == len(trainable) and \
+                len(decoders) == len(conditional)
+
+        # Assume decoders[0] is the base / in-domain decoder
+        super().__init__(decoders[0].dictionary)
+        self.decoders = nn.ModuleList(decoders)
+        self.num_decoders = len(decoders)
+        self.conditional = conditional
+        self.fusion_type = fusion_type
+
+        self.mixing_weights = None
+        if fusion_type == 'prob':
+            if mixing_weights is None:
+                mixing_weights = [1. / self.num_decoders] * self.num_decoders
+            self.mixing_weights = mixing_weights
+            print('| decoder mixing weights: {}'.format(self.mixing_weights))
+            if self.mixing_weights == 'learned':
+                base_decoder = self.decoders[0]
+                # Input: base_decoder output (B, T, C)
+                # Output: mixing weights at each time step (B, T, num_decoders)
+                self.mixing_gate = nn.Sequential(nn.Linear(base_decoder.hidden_size, self.num_decoders), nn.Softmax(dim=2))
+        elif fusion_type == 'output':
+            concat_size = sum([decoder.output_size for decoder in self.decoders])
+            self.fusion_fc_out = nn.Linear(concat_size, len(self.dictionary))
+
+        # Map word embedding. Assuming that the first decoder is the base decoder.
+        dict_maps = [None]
+        tgt_dict = self.dictionary  # decoders[0].dictionary
+        for decoder in self.decoders[1:]:
+            dict_map = self.get_dict_map(decoder.dictionary, tgt_dict)
+            dict_maps.append(dict_map)
+            # Map word embeddings to base decoder dictionary
+            new_weight = decoder.embed_tokens.weight[dict_map, :]
+            decoder.embed_tokens.weight = Parameter(new_weight)
+        self.dict_maps = dict_maps
+
+        for i, decoder in enumerate(self.decoders):
+            if not trainable[i]:
+                for name, param in decoder.named_parameters():
+                    param.requires_grad = False
+
+    def get_dict_map(self, src_dict, tgt_dict):
+        dict_map = []
+        for idx in range(len(tgt_dict)):
+            dict_map.append(src_dict.index(tgt_dict[idx]))
+        return dict_map
+
+    def forward(self, prev_output_tokens, encoder_out, incremental_states=None):
+        if incremental_states:
+            assert len(incremental_states) == len(self.decoders)
+        else:
+            incremental_states = [None] * len(self.decoders)
+
+        # Compute decoder outputs of all non-base / augmenting decoders
+        all_decoder_outs = []
+        for i, (decoder, conditional, incremental_state) in enumerate(
+                zip(self.decoders, self.conditional, incremental_states)):
+            if i == 0:
+                continue
+            _encoder_out = None if not conditional else encoder_out
+            decoder_out = decoder(prev_output_tokens, _encoder_out, incremental_state)
+            all_decoder_outs.append(decoder_out)
+
+        if self.fusion_type == 'input':
+            augmenting_inputs = torch.cat([decoder_out[2] for decoder_out in all_decoder_outs], 2)
+            decoder_out = self.decoders[0](prev_output_tokens, encoder_out, incremental_states[0], augmenting_inputs=augmenting_inputs)
+            return decoder_out
+        else:
+            # Run base decoder
+            decoder_out = self.decoders[0](prev_output_tokens, encoder_out, incremental_states[0])
+            all_decoder_outs.insert(0, decoder_out)
+            attn = decoder_out[1]
+
+            if self.fusion_type == 'prob':
+                if self.mixing_weights == 'learned':
+                    x = all_decoder_outs[0][2]  # base decoder outputs (B, T, C)
+                    mixing_weights = self.mixing_gate(x)  # (B, T, D)
+
+                all_probs = []
+                for i, (decoder, decoder_out, dict_map) in enumerate(
+                        zip(self.decoders, all_decoder_outs, self.dict_maps)):
+                    probs = decoder.get_normalized_probs(decoder_out, False, None)  # (B, T, V)
+                    if dict_map:
+                        probs = probs[:, :, dict_map]
+                    if self.mixing_weights == 'learned':
+                        probs = probs * mixing_weights[:, :, i].unsqueeze(2)
+                    else:
+                        probs = probs * self.mixing_weights[i]
+                    all_probs.append(probs)
+
+                final_probs = sum(all_probs)
+                return final_probs, attn
+
+            elif self.fusion_type == 'output':
+                outputs = torch.cat([decoder_out[2] for decoder_out in all_decoder_outs], 2)
+                # Map to vocab size
+                x = self.fusion_fc_out(outputs)
+                return x, attn
+
+    def reorder_incremental_state(self, incremental_states, new_order):
+        for decoder, incremental_state in zip(self.decoders, incremental_states):
+            decoder.reorder_incremental_state(incremental_state, new_order)
+
+    def get_normalized_probs(self, net_output, log_probs, _):
+        """Get normalized probabilities (or log probs) from a net's output."""
+        if self.fusion_type == 'prob':
+            if not log_probs:
+                return net_output[0]
+            else:
+                return torch.log(net_output[0])
+        else:
+            return super().get_normalized_probs(net_output, log_probs, _)
+
+    def max_positions(self):
+        """Maximum input length supported by the encoder."""
+        return min([d.max_positions() for d in self.decoders])
+
 
 class LSTMDecoder(FairseqIncrementalDecoder):
     """LSTM decoder."""
@@ -251,6 +420,7 @@ class LSTMDecoder(FairseqIncrementalDecoder):
         self, dictionary, embed_dim=512, hidden_size=512, out_embed_dim=512,
         num_layers=1, dropout_in=0.1, dropout_out=0.1, attention=True,
         encoder_embed_dim=512, encoder_output_units=512, pretrained_embed=None,
+        additional_input_size=0,
     ):
         super().__init__(dictionary)
         self.dropout_in = dropout_in
@@ -271,7 +441,7 @@ class LSTMDecoder(FairseqIncrementalDecoder):
 
         self.layers = nn.ModuleList([
             LSTMCell(
-                input_size=encoder_output_units + embed_dim if layer == 0 else hidden_size,
+                input_size=encoder_output_units + embed_dim + additional_input_size if layer == 0 else hidden_size,
                 hidden_size=hidden_size,
             )
             for layer in range(num_layers)
@@ -281,7 +451,15 @@ class LSTMDecoder(FairseqIncrementalDecoder):
             self.additional_fc = Linear(hidden_size, out_embed_dim)
         self.fc_out = Linear(out_embed_dim, num_embeddings, dropout=dropout_out)
 
-    def forward(self, prev_output_tokens, encoder_out_dict, incremental_state=None):
+    @property
+    def output_size(self):
+        return self.hidden_size
+
+    def disable_output_layer(self):
+        for param in self.fc_out.parameters():
+            param.requires_grad = False
+
+    def forward(self, prev_output_tokens, encoder_out_dict, incremental_state=None, augmenting_inputs=None):
         encoder_out = encoder_out_dict['encoder_out']
         encoder_padding_mask = encoder_out_dict['encoder_padding_mask']
 
@@ -296,6 +474,10 @@ class LSTMDecoder(FairseqIncrementalDecoder):
         # embed tokens
         x = self.embed_tokens(prev_output_tokens)
         x = F.dropout(x, p=self.dropout_in, training=self.training)
+
+        # concat augmenting inputs
+        if augmenting_inputs is not None:
+            x = torch.cat([x, augmenting_inputs], 2)
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
@@ -358,9 +540,10 @@ class LSTMDecoder(FairseqIncrementalDecoder):
         if hasattr(self, 'additional_fc'):
             x = self.additional_fc(x)
             x = F.dropout(x, p=self.dropout_out, training=self.training)
-        x = self.fc_out(x)
+        outputs = x  # last layer representation
+        x = self.fc_out(x)  # logits
 
-        return x, attn_scores
+        return x, attn_scores, outputs
 
     def reorder_incremental_state(self, incremental_state, new_order):
         super().reorder_incremental_state(incremental_state, new_order)
