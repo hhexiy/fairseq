@@ -343,11 +343,12 @@ class MultiDecoder(FairseqIncrementalDecoder):
             dict_map.append(src_dict.index(tgt_dict[idx]))
         return dict_map
 
+    def get_init_incremental_state(self):
+        return [d.get_init_incremental_state() for d in self.decoders]
+
     def forward(self, prev_output_tokens, encoder_out, incremental_states=None):
-        if incremental_states:
+        if incremental_states is not None:
             assert len(incremental_states) == len(self.decoders)
-        else:
-            incremental_states = [None] * len(self.decoders)
 
         # Compute decoder outputs of all non-base / augmenting decoders
         all_decoder_outs = []

@@ -126,7 +126,7 @@ class SequenceGenerator(object):
             if not self.retain_dropout:
                 model.eval()
             if isinstance(model.decoder, FairseqIncrementalDecoder):
-                incremental_states[model] = {}
+                incremental_states[model] = model.decoder.get_init_incremental_state()
             else:
                 incremental_states[model] = None
 

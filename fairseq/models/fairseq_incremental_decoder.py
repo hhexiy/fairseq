@@ -17,6 +17,9 @@ class FairseqIncrementalDecoder(FairseqDecoder):
     def forward(self, prev_output_tokens, encoder_out, incremental_state=None):
         raise NotImplementedError
 
+    def get_init_incremental_state(self):
+        return {}
+
     def reorder_incremental_state(self, incremental_state, new_order):
         """Reorder incremental state.
 
