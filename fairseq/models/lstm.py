@@ -348,7 +348,9 @@ class MultiDecoder(FairseqIncrementalDecoder):
 
     def forward(self, prev_output_tokens, encoder_out, incremental_states=None):
         if incremental_states is not None:
-            assert len(incremental_states) == len(self.decoders)
+            assert len(incremental_states) == self.num_decoders
+        else:
+            incremental_states = [None] * self.num_decoders
 
         # Compute decoder outputs of all non-base / augmenting decoders
         all_decoder_outs = []
