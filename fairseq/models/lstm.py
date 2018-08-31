@@ -29,6 +29,7 @@ class LSTMModel(FairseqModel):
     @staticmethod
     def add_args(parser):
         """Add model-specific arguments to the parser."""
+        parser.add_argument('--encoder', default='lstm', choices=['lstm', 'bow'])
         parser.add_argument('--dropout', default=0.1, type=float, metavar='D',
                             help='dropout probability')
         parser.add_argument('--encoder-embed-dim', type=int, metavar='N',
@@ -106,6 +107,7 @@ class LSTMModel(FairseqModel):
             if args.fusion_type == 'input':
                 additional_input_size = lm.decoder.output_size
 
+        #if args.encoder == 'lstm':
         encoder = LSTMEncoder(
             dictionary=task.source_dictionary,
             embed_dim=args.encoder_embed_dim,
@@ -116,6 +118,14 @@ class LSTMModel(FairseqModel):
             bidirectional=args.encoder_bidirectional,
             pretrained_embed=pretrained_encoder_embed,
         )
+        #elif args.encoder == 'bow':
+        #    encoder = BoWEncoder(
+        #        dictionary=task.source_dictionary,
+        #        embed_dim=args.encoder_embed_dim,
+        #        dropout_in=args.encoder_dropout_in,
+        #        pretrained_embed=pretrained_encoder_embed,
+        #        )
+
         decoder = LSTMDecoder(
             dictionary=task.target_dictionary,
             embed_dim=args.decoder_embed_dim,
@@ -260,6 +270,45 @@ class LSTMEncoder(FairseqEncoder):
     def max_positions(self):
         """Maximum input length supported by the encoder."""
         return int(1e5)  # an arbitrary large number
+
+
+class BoWEncoder(LSTMEncoder):
+    def __init__(
+        self, dictionary, embed_dim=512, dropout_in=0.1,
+        left_pad=True, pretrained_embed=None, padding_value=0.,
+    ):
+        FairseqEncoder.__init__(self, dictionary)
+        num_embeddings = len(dictionary)
+        self.padding_idx = dictionary.pad()
+        if pretrained_embed is None:
+            self.embed_tokens = Embedding(num_embeddings, embed_dim, self.padding_idx)
+        else:
+            self.embed_tokens = pretrained_embed
+        self.padding_value = padding_value
+        self.output_units = embed_dim
+        self.dropout_in = dropout_in
+
+    def forward(self, src_tokens, src_lengths):
+        # embed tokens
+        x = self.embed_tokens(src_tokens)
+        x = F.dropout(x, p=self.dropout_in, training=self.training)
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+
+        encoder_padding_mask = src_tokens.eq(self.padding_idx).t()  # T x B
+
+        # non-padding elements
+        m = encoder_padding_mask.eq(0).float()  # T x B
+        mean_x = torch.sum(x * m.unsqueeze(2), 0) / torch.sum(m, 0).unsqueeze(1)
+        mean_x = mean_x.unsqueeze(0)
+        # TODO: mask pad
+        #mean_x = x.mean(dim=0, keepdim=True)  # B x C
+
+        return {
+            'encoder_out': (x, mean_x, mean_x),
+            'encoder_padding_mask': encoder_padding_mask if encoder_padding_mask.any() else None
+        }
 
 
 class AttentionLayer(nn.Module):
