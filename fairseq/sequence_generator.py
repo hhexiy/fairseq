@@ -107,12 +107,12 @@ class SequenceGenerator(object):
                 ref = utils.strip_pad(s['target'].data[i, :], self.pad) if s['target'] is not None else None
                 yield id, src, ref, hypos[i]
 
-    def generate(self, src_tokens, src_lengths, beam_size=None, maxlen=None, prefix_tokens=None):
+    def generate(self, src_tokens, src_lengths, beam_size=None, maxlen=None, prefix_tokens=None, pun_prob=None, alter_prob=None):
         """Generate a batch of translations."""
         with torch.no_grad():
-            return self._generate(src_tokens, src_lengths, beam_size, maxlen, prefix_tokens)
+            return self._generate(src_tokens, src_lengths, beam_size, maxlen, prefix_tokens, pun_prob, alter_prob)
 
-    def _generate(self, src_tokens, src_lengths, beam_size=None, maxlen=None, prefix_tokens=None):
+    def _generate(self, src_tokens, src_lengths, beam_size=None, maxlen=None, prefix_tokens=None, pun_prob=None, alter_prob=None):
         bsz, srclen = src_tokens.size()
         maxlen = min(maxlen, self.maxlen) if maxlen is not None else self.maxlen
 
@@ -291,8 +291,13 @@ class SequenceGenerator(object):
                     if hasattr(model, 'encoder'):
                         encoder_outs[i] = model.encoder.reorder_encoder_out(encoder_outs[i], reorder_state)
 
+            #if step < 5:
+            #    mix_prob = pun_prob
+            #else:
+            #    mix_prob = alter_prob
+            mix_prob = pun_prob
             probs, avg_attn_scores = self._decode(
-                tokens[:, :step + 1], encoder_outs, incremental_states)
+                tokens[:, :step + 1], encoder_outs, incremental_states, mix_prob)
             if step == 0:
                 # at the first step all hypotheses are equally likely, so use
                 # only the first beam
@@ -513,14 +518,14 @@ class SequenceGenerator(object):
 
         return finalized
 
-    def _decode(self, tokens, encoder_outs, incremental_states):
+    def _decode(self, tokens, encoder_outs, incremental_states, mix_prob=None):
         if len(self.models) == 1:
-            return self._decode_one(tokens, self.models[0], encoder_outs[0], incremental_states, log_probs=True)
+            return self._decode_one(tokens, self.models[0], encoder_outs[0], incremental_states, log_probs=True, mix_prob=mix_prob)
 
         avg_probs = None
         avg_attn = None
         for model, encoder_out, w in zip(self.models, encoder_outs, [0.5, 0.5]):
-            probs, attn = self._decode_one(tokens, model, encoder_out, incremental_states, log_probs=False)
+            probs, attn = self._decode_one(tokens, model, encoder_out, incremental_states, log_probs=False, mix_prob=mix_prob)
             probs = w * probs
             if avg_probs is None:
                 avg_probs = probs
@@ -537,7 +542,7 @@ class SequenceGenerator(object):
             avg_attn.div_(len(self.models))
         return avg_probs, avg_attn
 
-    def _decode_one(self, tokens, model, encoder_out, incremental_states, log_probs):
+    def _decode_one(self, tokens, model, encoder_out, incremental_states, log_probs, mix_prob=None):
         if isinstance(model, FairseqLanguageModel):
             encoder_out = None
         with torch.no_grad():
@@ -557,4 +562,9 @@ class SequenceGenerator(object):
         else:
             decoder_out[0] = decoder_out[0][:, -1, :]  # (B, C)
             probs = model.get_normalized_probs(decoder_out, log_probs=log_probs)
+        if not mix_prob is None:
+            probs = model.get_normalized_probs(decoder_out, log_probs=False)
+            probs = 0.8 * probs + 0.2 * mix_prob
+            if log_probs:
+                probs = probs.log_()
         return probs, attn
