@@ -11,5 +11,6 @@ from .indexed_dataset import IndexedInMemoryDataset, IndexedRawTextDataset
 from .language_pair_dataset import LanguagePairDataset
 from .monolingual_dataset import MonolingualDataset
 from .token_block_dataset import TokenBlockDataset
+from .edit_dataset import EditDatasetSrcWrapper, EditDataset
 
 from .data_utils import EpochBatchIterator
