@@ -31,6 +31,7 @@ class EditTask(FairseqTask):
         parser.add_argument('--max-target-positions', default=1024, type=int, metavar='N',
                             help='max number of tokens in the target sequence')
         parser.add_argument('--insert', default='none', choices=['none', 'deleted', 'related'])
+        parser.add_argument('--combine', default='embedding', choices=['embedding', 'token'], help='how to combine the template input and the insertion input')
 
     def __init__(self, args, src_dict, tgt_dict):
         super().__init__(args)
@@ -96,6 +97,7 @@ class EditTask(FairseqTask):
             max_source_positions=self.args.max_source_positions,
             max_target_positions=self.args.max_target_positions,
             insert=self.args.insert,
+            combine=self.args.combine,
         )
 
     @property

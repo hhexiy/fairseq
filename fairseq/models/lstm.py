@@ -313,10 +313,13 @@ class BoWEncoder(LSTMEncoder):
 
 class AttentionLayer(nn.Module):
     def __init__(self, input_embed_dim, output_embed_dim):
+        # input_embed_dim: decoder hidden_size
+        # output_embed_dim: encoder_out_units
         super().__init__()
 
         self.input_proj = Linear(input_embed_dim, output_embed_dim, bias=False)
-        self.output_proj = Linear(2*output_embed_dim, output_embed_dim, bias=False)
+        #self.output_proj = Linear(2*output_embed_dim, output_embed_dim, bias=False)
+        self.output_proj = Linear(output_embed_dim + input_embed_dim, input_embed_dim, bias=False)
 
     def forward(self, input, source_hids, encoder_padding_mask):
         # input: bsz x input_embed_dim
@@ -487,18 +490,19 @@ class LSTMDecoder(FairseqIncrementalDecoder):
             self.embed_tokens = pretrained_embed
 
         self.encoder_output_units = encoder_output_units
-        assert encoder_output_units == hidden_size, \
-            'encoder_output_units ({}) != hidden_size ({})'.format(encoder_output_units, hidden_size)
+        #assert encoder_output_units == hidden_size, \
+        #    'encoder_output_units ({}) != hidden_size ({})'.format(encoder_output_units, hidden_size)
         # TODO another Linear layer if not equal
 
+        # input_size = attention_output_size + input_embed_size
         self.layers = nn.ModuleList([
             LSTMCell(
-                input_size=encoder_output_units + embed_dim + additional_input_size if layer == 0 else hidden_size,
+                input_size=hidden_size + embed_dim + additional_input_size if layer == 0 else hidden_size,
                 hidden_size=hidden_size,
             )
             for layer in range(num_layers)
         ])
-        self.attention = AttentionLayer(encoder_output_units, hidden_size) if attention else None
+        self.attention = AttentionLayer(hidden_size, encoder_output_units) if attention else None
         if hidden_size != out_embed_dim:
             self.additional_fc = Linear(hidden_size, out_embed_dim)
         self.fc_out = Linear(out_embed_dim, num_embeddings, dropout=dropout_out)
@@ -543,7 +547,7 @@ class LSTMDecoder(FairseqIncrementalDecoder):
             num_layers = len(self.layers)
             prev_hiddens = [encoder_hiddens[i] for i in range(num_layers)]
             prev_cells = [encoder_cells[i] for i in range(num_layers)]
-            input_feed = x.data.new(bsz, self.encoder_output_units).zero_()
+            input_feed = x.data.new(bsz, self.hidden_size).zero_()
 
         attn_scores = x.data.new(srclen, seqlen, bsz).zero_()
         outs = []

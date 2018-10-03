@@ -82,7 +82,7 @@ class EditDataset(LanguagePairDataset):
         left_pad_source=True, left_pad_target=False,
         max_source_positions=1024, max_target_positions=1024,
         shuffle=True,
-        insert='none',
+        insert='none', combine='embedding',
     ):
         super().__init__(
             src, src_sizes, src_dict,
@@ -92,6 +92,7 @@ class EditDataset(LanguagePairDataset):
             shuffle=shuffle,
             )
         self.insert = insert
+        self.combine = combine
 
     def __getitem__(self, index):
         item = {
@@ -103,14 +104,29 @@ class EditDataset(LanguagePairDataset):
             item['source-insert'] = self.src[index]['deleted']
         elif self.insert == 'related':
             item['source-insert'] = self.src[index]['related']
+        if self.combine == 'token' and self.insert != 'none':
+            # TODO: use different seperator
+            template = torch.cat((item['source-template'], item['source-insert'], torch.LongTensor([self.src_dict.eos()])), dim=0)
+            #print(item['source-template'])
+            #print(item['source-template'].size())
+            #print(item['source-insert'])
+            #print(item['source-insert'].size())
+            #eos = self.src_dict.eos()
+            #print(eos)
+            #print(torch.LongTensor([eos]).size())
+            #print(torch.LongTensor([eos]))
+            #print(template.size())
+            #import sys; sys.exit()
+            item['source-template'] = template
         return item
 
     def collater(self, samples):
         """Merge a list of samples to form a mini-batch."""
+        insert = 'none' if self.combine == 'token' else self.insert
         return collate(
             samples, pad_idx=self.src_dict.pad(), eos_idx=self.src_dict.eos(),
             left_pad_source=self.left_pad_source, left_pad_target=self.left_pad_target,
-            insert=self.insert,
+            insert=insert,
         )
 
     def get_dummy_batch(self, num_tokens, max_positions, src_len=128, tgt_len=128):

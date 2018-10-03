@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from fairseq import options, utils, tasks
+from fairseq import options, utils
 
 from . import (
     FairseqEncoder, FairseqIncrementalDecoder, FairseqModel, register_model,
@@ -111,14 +111,19 @@ class EditLSTMDecoder(LSTMDecoder):
         encoder_embed_dim=512, encoder_output_units=512, pretrained_embed=None,
         additional_input_size=0,
     ):
+        self.use_fc = False
+        if self.use_fc:
+            self.fc_insert = Linear(encoder_output_units + encoder_embed_dim, hidden_size)
+        else:
+            hidden_size = hidden_size + encoder_embed_dim
+            out_embed_dim = out_embed_dim + encoder_embed_dim
+
         super().__init__(
             dictionary, embed_dim=embed_dim, hidden_size=hidden_size, out_embed_dim=out_embed_dim,
             num_layers=num_layers, dropout_in=dropout_in, dropout_out=dropout_out, attention=attention,
             encoder_embed_dim=encoder_embed_dim, encoder_output_units=encoder_output_units, pretrained_embed=pretrained_embed,
             additional_input_size=additional_input_size,
         )
-
-        self.fc_insert = Linear(encoder_output_units + encoder_embed_dim, hidden_size)
 
     def concat_with_state(self, state, t):
         # state: (L, B, C)
@@ -160,19 +165,24 @@ class EditLSTMDecoder(LSTMDecoder):
             _, encoder_hiddens, encoder_cells = encoder_out[:3]
 
             # Combine with insertions
-            encoder_hiddens = self.fc_insert(self.concat_with_state(encoder_hiddens, encoder_insert))
-            encoder_cells = self.fc_insert(self.concat_with_state(encoder_cells, encoder_insert))
+            encoder_hiddens = self.concat_with_state(encoder_hiddens, encoder_insert)
+            encoder_cells = self.concat_with_state(encoder_cells, encoder_insert)
+            if self.use_fc:
+                encoder_hiddens = self.fc_insert(encoder_hiddens)
+                encoder_cells = self.fc_insert(encoder_cells)
 
             num_layers = len(self.layers)
             prev_hiddens = [encoder_hiddens[i] for i in range(num_layers)]
             prev_cells = [encoder_cells[i] for i in range(num_layers)]
-            input_feed = x.data.new(bsz, self.encoder_output_units).zero_()
+            input_feed = x.data.new(bsz, self.hidden_size).zero_()
 
         attn_scores = x.data.new(srclen, seqlen, bsz).zero_()
         outs = []
         for j in range(seqlen):
             # input feeding: concatenate context vector from previous time step
             input = torch.cat((x[j, :, :], input_feed), dim=1)
+            #print(input_feed.size())
+            #print(input.size())
 
             for i, rnn in enumerate(self.layers):
                 # recurrent cell
