@@ -1,7 +1,10 @@
 import numpy as np
 import torch
 
+from fairseq import utils
+
 from . import data_utils, LanguagePairDataset, IndexedInMemoryDataset
+
 
 class EditDatasetSrcWrapper(object):
     def __init__(self, ds):
@@ -12,7 +15,7 @@ class EditDatasetSrcWrapper(object):
     def __getitem__(self, index):
         return {
                 'deleted': self.ds[index * 2 + 0],
-                'template': self.ds[index * 2 + 2],
+                'template': self.ds[index * 2 + 1],
                 }
 
     def __len__(self):
@@ -100,7 +103,7 @@ class EditDataset(LanguagePairDataset):
 
     def insert_id(self, a):
         for i, v in enumerate(a):
-            if v == self.self.placeholder_index:
+            if v == self.placeholder_index:
                 return i
         raise Exception('Cannot find placeholder.')
 
@@ -111,10 +114,10 @@ class EditDataset(LanguagePairDataset):
             'target': self.tgt[index] if self.tgt is not None else None,
         }
         if self.insert == 'deleted':
-            item['source-insert'] = self.src[index]['deleted']
+            # Ignore EOS
+            item['source-insert'] = self.src[index]['deleted'][:-1]
         if self.combine == 'token' and self.insert != 'none':
             id_ = self.insert_id(item['source-template'])
-            # TODO: use different seperator
             #template = torch.cat((item['source-template'], item['source-insert'], torch.LongTensor([self.src_dict.eos()])), dim=0)
             template = torch.cat((
                 item['source-template'][:id_],
@@ -123,17 +126,10 @@ class EditDataset(LanguagePairDataset):
                 torch.LongTensor([self.src_dict.index(self.EOI)]),
                 item['source-template'][id_+1:],
                 ), dim=0)
-            #print(item['source-template'])
-            #print(item['source-template'].size())
-            #print(item['source-insert'])
-            #print(item['source-insert'].size())
-            #eos = self.src_dict.eos()
-            #print(eos)
-            #print(torch.LongTensor([eos]).size())
-            #print(torch.LongTensor([eos]))
-            #print(template.size())
-            #import sys; sys.exit()
             item['source-template'] = template
+            #print([self.src_dict[x] for x in item['source-template']])
+            #print([self.tgt_dict[x] for x in item['target']])
+            #import sys; sys.exit()
         return item
 
     def collater(self, samples):
@@ -146,8 +142,11 @@ class EditDataset(LanguagePairDataset):
         )
 
     def get_dummy_batch(self, num_tokens, max_positions, src_len=128, tgt_len=128):
-        max_source_positions, max_target_positions = self._get_max_positions(max_positions)
-        src_len, tgt_len = min(src_len, max_source_positions), min(tgt_len, max_target_positions)
+        src_len, tgt_len = utils.resolve_max_positions(
+            (src_len, tgt_len),
+            max_positions,
+            (self.max_source_positions, self.max_target_positions),
+        )
         bsz = num_tokens // max(src_len, tgt_len)
         return self.collater([
             {

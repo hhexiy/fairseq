@@ -60,7 +60,7 @@ class EditTask(FairseqTask):
 
         return cls(args, src_dict, tgt_dict)
 
-    def load_dataset(self, split):
+    def load_dataset(self, split, combine=False, **kwargs):
         """Load a dataset split."""
 
         def split_exists(src, tgt, lang):
