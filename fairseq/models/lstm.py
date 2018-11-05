@@ -13,8 +13,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from fairseq import options, utils, tasks
-
+from fairseq import options, utils
+from fairseq.modules import AdaptiveSoftmax
 from . import (
     FairseqEncoder, FairseqIncrementalDecoder, FairseqModel, register_model,
     register_model_architecture
@@ -30,11 +30,11 @@ class LSTMModel(FairseqModel):
     def add_args(parser):
         """Add model-specific arguments to the parser."""
         parser.add_argument('--encoder', default='lstm', choices=['lstm', 'bow'])
-        parser.add_argument('--dropout', default=0.1, type=float, metavar='D',
+        parser.add_argument('--dropout', type=float, metavar='D',
                             help='dropout probability')
         parser.add_argument('--encoder-embed-dim', type=int, metavar='N',
                             help='encoder embedding dimension')
-        parser.add_argument('--encoder-embed-path', default=None, type=str, metavar='STR',
+        parser.add_argument('--encoder-embed-path', type=str, metavar='STR',
                             help='path to pre-trained encoder embedding')
         parser.add_argument('--encoder-hidden-size', type=int, metavar='N',
                             help='encoder hidden size')
@@ -44,7 +44,7 @@ class LSTMModel(FairseqModel):
                             help='make all layers of encoder bidirectional')
         parser.add_argument('--decoder-embed-dim', type=int, metavar='N',
                             help='decoder embedding dimension')
-        parser.add_argument('--decoder-embed-path', default=None, type=str, metavar='STR',
+        parser.add_argument('--decoder-embed-path', type=str, metavar='STR',
                             help='path to pre-trained decoder embedding')
         parser.add_argument('--decoder-hidden-size', type=int, metavar='N',
                             help='decoder hidden size')
@@ -54,6 +54,9 @@ class LSTMModel(FairseqModel):
                             help='decoder output embedding dimension')
         parser.add_argument('--decoder-attention', type=str, metavar='BOOL',
                             help='decoder attention')
+        parser.add_argument('--adaptive-softmax-cutoff', metavar='EXPR',
+                            help='comma separated list of adaptive softmax cutoff points. '
+                                 'Must be used with adaptive_loss criterion')
 
         # Granular dropout settings (if not specified these default to --dropout)
         parser.add_argument('--encoder-dropout-in', type=float, metavar='D',
@@ -64,6 +67,12 @@ class LSTMModel(FairseqModel):
                             help='dropout probability for decoder input embedding')
         parser.add_argument('--decoder-dropout-out', type=float, metavar='D',
                             help='dropout probability for decoder output')
+        parser.add_argument('--share-decoder-input-output-embed', default=False,
+                            action='store_true',
+                            help='share decoder input and output embeddings')
+        parser.add_argument('--share-all-embeddings', default=False, action='store_true',
+                            help='share encoder, decoder and output embeddings'
+                                 ' (requires shared dictionary and embed dim)')
 
         parser.add_argument('--pretrained-lm', default=None, type=str, metavar='STR',
                             help='path to pre-trained language model')
@@ -86,14 +95,47 @@ class LSTMModel(FairseqModel):
             utils.print_embed_overlap(embed_dict, dictionary)
             return utils.load_embedding(embed_dict, dictionary, embed_tokens)
 
-        pretrained_encoder_embed = None
         if args.encoder_embed_path:
             pretrained_encoder_embed = load_pretrained_embedding_from_file(
                 args.encoder_embed_path, task.source_dictionary, args.encoder_embed_dim)
-        pretrained_decoder_embed = None
-        if args.decoder_embed_path:
-            pretrained_decoder_embed = load_pretrained_embedding_from_file(
-                args.decoder_embed_path, task.target_dictionary, args.decoder_embed_dim)
+        else:
+            num_embeddings = len(task.source_dictionary)
+            pretrained_encoder_embed = Embedding(
+                num_embeddings, args.encoder_embed_dim, task.source_dictionary.pad()
+            )
+
+        if args.share_all_embeddings:
+            # double check all parameters combinations are valid
+            if task.source_dictionary != task.target_dictionary:
+                raise ValueError('--share-all-embeddings requires a joint dictionary')
+            if args.decoder_embed_path and (
+                    args.decoder_embed_path != args.encoder_embed_path):
+                raise ValueError(
+                    '--share-all-embed not compatible with --decoder-embed-path'
+                )
+            if args.encoder_embed_dim != args.decoder_embed_dim:
+                raise ValueError(
+                    '--share-all-embeddings requires --encoder-embed-dim to '
+                    'match --decoder-embed-dim'
+                )
+            pretrained_decoder_embed = pretrained_encoder_embed
+            args.share_decoder_input_output_embed = True
+        else:
+            # separate decoder input embeddings
+            pretrained_decoder_embed = None
+            if args.decoder_embed_path:
+                pretrained_decoder_embed = load_pretrained_embedding_from_file(
+                    args.decoder_embed_path,
+                    task.target_dictionary,
+                    args.decoder_embed_dim
+                )
+        # one last double check of parameter combinations
+        if args.share_decoder_input_output_embed and (
+                args.decoder_embed_dim != args.decoder_out_embed_dim):
+            raise ValueError(
+                '--share-decoder-input-output-embeddings requires '
+                '--decoder-embed-dim to match --decoder-out-embed-dim'
+            )
 
         additional_input_size = 0
         if args.pretrained_lm:
@@ -139,6 +181,11 @@ class LSTMModel(FairseqModel):
             encoder_output_units=encoder.output_units,
             pretrained_embed=pretrained_decoder_embed,
             additional_input_size=additional_input_size,
+            share_input_output_embed=args.share_decoder_input_output_embed,
+            adaptive_softmax_cutoff=(
+                options.eval_str_list(args.adaptive_softmax_cutoff, type=int)
+                if args.criterion == 'adaptive_loss' else None
+            ),
         )
 
         if args.pretrained_lm:
@@ -204,6 +251,7 @@ class LSTMEncoder(FairseqEncoder):
         if bidirectional:
             self.output_units *= 2
 
+
     def forward(self, src_tokens, src_lengths):
         if self.left_pad:
             # convert left-padding to right-padding
@@ -242,10 +290,7 @@ class LSTMEncoder(FairseqEncoder):
         if self.bidirectional:
 
             def combine_bidir(outs):
-                return torch.cat([
-                    torch.cat([outs[2 * i], outs[2 * i + 1]], dim=0).view(1, bsz, self.output_units)
-                    for i in range(self.num_layers)
-                ], dim=0)
+                return outs.view(self.num_layers, 2, bsz, -1).transpose(1, 2).contiguous().view(self.num_layers, bsz, -1)
 
             final_hiddens = combine_bidir(final_hiddens)
             final_cells = combine_bidir(final_cells)
@@ -257,15 +302,15 @@ class LSTMEncoder(FairseqEncoder):
             'encoder_padding_mask': encoder_padding_mask if encoder_padding_mask.any() else None
         }
 
-    def reorder_encoder_out(self, encoder_out_dict, new_order):
-        encoder_out_dict['encoder_out'] = tuple(
+    def reorder_encoder_out(self, encoder_out, new_order):
+        encoder_out['encoder_out'] = tuple(
             eo.index_select(1, new_order)
-            for eo in encoder_out_dict['encoder_out']
+            for eo in encoder_out['encoder_out']
         )
-        if encoder_out_dict['encoder_padding_mask'] is not None:
-            encoder_out_dict['encoder_padding_mask'] = \
-                encoder_out_dict['encoder_padding_mask'].index_select(1, new_order)
-        return encoder_out_dict
+        if encoder_out['encoder_padding_mask'] is not None:
+            encoder_out['encoder_padding_mask'] = \
+                encoder_out['encoder_padding_mask'].index_select(1, new_order)
+        return encoder_out
 
     def max_positions(self):
         """Maximum input length supported by the encoder."""
@@ -318,8 +363,7 @@ class AttentionLayer(nn.Module):
         super().__init__()
 
         self.input_proj = Linear(input_embed_dim, output_embed_dim, bias=False)
-        #self.output_proj = Linear(2*output_embed_dim, output_embed_dim, bias=False)
-        self.output_proj = Linear(output_embed_dim + input_embed_dim, input_embed_dim, bias=False)
+        self.output_proj = Linear(input_embed_dim + output_embed_dim, output_embed_dim, bias=False)
 
     def forward(self, input, source_hids, encoder_padding_mask):
         # input: bsz x input_embed_dim
@@ -476,12 +520,16 @@ class LSTMDecoder(FairseqIncrementalDecoder):
         num_layers=1, dropout_in=0.1, dropout_out=0.1, attention=True,
         encoder_embed_dim=512, encoder_output_units=512, pretrained_embed=None,
         additional_input_size=0,
+        share_input_output_embed=False, adaptive_softmax_cutoff=None,
     ):
         super().__init__(dictionary)
         self.dropout_in = dropout_in
         self.dropout_out = dropout_out
         self.hidden_size = hidden_size
+        self.share_input_output_embed = share_input_output_embed
+        self.need_attn = True
 
+        self.adaptive_softmax = None
         num_embeddings = len(dictionary)
         padding_idx = dictionary.pad()
         if pretrained_embed is None:
@@ -505,7 +553,13 @@ class LSTMDecoder(FairseqIncrementalDecoder):
         self.attention = AttentionLayer(hidden_size, encoder_output_units) if attention else None
         if hidden_size != out_embed_dim:
             self.additional_fc = Linear(hidden_size, out_embed_dim)
-        self.fc_out = Linear(out_embed_dim, num_embeddings, dropout=dropout_out)
+        if adaptive_softmax_cutoff is not None:
+            # setting adaptive_softmax dropout to dropout_out for now but can be redefined
+            self.adaptive_softmax = AdaptiveSoftmax(num_embeddings, embed_dim, adaptive_softmax_cutoff,
+                                                    dropout=dropout_out)
+        elif not self.share_input_output_embed:
+            self.fc_out = Linear(out_embed_dim, num_embeddings, dropout=dropout_out)
+
 
     @property
     def output_size(self):
@@ -590,16 +644,21 @@ class LSTMDecoder(FairseqIncrementalDecoder):
         x = x.transpose(1, 0)
 
         # srclen x tgtlen x bsz -> bsz x tgtlen x srclen
-        attn_scores = attn_scores.transpose(0, 2)
+        if not self.training and self.need_attn:
+            attn_scores = attn_scores.transpose(0, 2)
+        else:
+            attn_scores = None
 
         # project back to size of vocabulary
-        if hasattr(self, 'additional_fc'):
-            x = self.additional_fc(x)
-            x = F.dropout(x, p=self.dropout_out, training=self.training)
-        outputs = x  # last layer representation
-        x = self.fc_out(x)  # logits
-
-        return x, attn_scores, outputs
+        if self.adaptive_softmax is None:
+            if hasattr(self, 'additional_fc'):
+                x = self.additional_fc(x)
+                x = F.dropout(x, p=self.dropout_out, training=self.training)
+            if self.share_input_output_embed:
+                x = F.linear(x, self.embed_tokens.weight)
+            else:
+                x = self.fc_out(x)
+        return x, attn_scores
 
     def reorder_incremental_state(self, incremental_state, new_order):
         super().reorder_incremental_state(incremental_state, new_order)
@@ -618,6 +677,9 @@ class LSTMDecoder(FairseqIncrementalDecoder):
     def max_positions(self):
         """Maximum output length supported by the decoder."""
         return int(1e5)  # an arbitrary large number
+
+    def make_generation_fast_(self, need_attn=False, **kwargs):
+        self.need_attn = need_attn
 
 
 def Embedding(num_embeddings, embedding_dim, padding_idx):
@@ -644,7 +706,7 @@ def LSTMCell(input_size, hidden_size, **kwargs):
 
 
 def Linear(in_features, out_features, bias=True, dropout=0):
-    """Weight-normalized Linear layer (input: N x T x C)"""
+    """Linear layer (input: N x T x C)"""
     m = nn.Linear(in_features, out_features, bias=bias)
     m.weight.data.uniform_(-0.1, 0.1)
     if bias:
@@ -654,6 +716,7 @@ def Linear(in_features, out_features, bias=True, dropout=0):
 
 @register_model_architecture('lstm', 'lstm')
 def base_architecture(args):
+    args.dropout = getattr(args, 'dropout', 0.1)
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 512)
     args.encoder_embed_path = getattr(args, 'encoder_embed_path', None)
     args.encoder_hidden_size = getattr(args, 'encoder_hidden_size', args.encoder_embed_dim)
@@ -669,10 +732,13 @@ def base_architecture(args):
     args.decoder_attention = getattr(args, 'decoder_attention', '1')
     args.decoder_dropout_in = getattr(args, 'decoder_dropout_in', args.dropout)
     args.decoder_dropout_out = getattr(args, 'decoder_dropout_out', args.dropout)
-
+    args.share_decoder_input_output_embed = getattr(args, 'share_decoder_input_output_embed', False)
+    args.share_all_embeddings = getattr(args, 'share_all_embeddings', False)
+    args.adaptive_softmax_cutoff = getattr(args, 'adaptive_softmax_cutoff', '10000,50000,200000')
 
 @register_model_architecture('lstm', 'lstm_wiseman_iwslt_de_en')
 def lstm_wiseman_iwslt_de_en(args):
+    args.dropout = getattr(args, 'dropout', 0.1)
     args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 256)
     args.encoder_dropout_in = getattr(args, 'encoder_dropout_in', 0)
     args.encoder_dropout_out = getattr(args, 'encoder_dropout_out', 0)

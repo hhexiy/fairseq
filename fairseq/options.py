@@ -35,6 +35,10 @@ def get_generation_parser(interactive=False, default_task='translation'):
     return parser
 
 
+def get_interactive_generation_parser(default_task='translation'):
+    return get_generation_parser(interactive=True, default_task=default_task)
+
+
 def get_eval_lm_parser(default_task='language_modeling'):
     parser = get_parser('Evaluate Language Model', default_task)
     add_dataset_args(parser, gen=True)
@@ -62,7 +66,7 @@ def eval_bool(x, default=False):
         return default
 
 
-def parse_args_and_arch(parser, input_args=None):
+def parse_args_and_arch(parser, input_args=None, parse_known=False):
     # The parser doesn't know about model/criterion/optimizer-specific args, so
     # we parse twice. First we parse the model/criterion/optimizer, then we
     # parse a second time after adding the *-specific arguments.
@@ -90,7 +94,11 @@ def parse_args_and_arch(parser, input_args=None):
         TASK_REGISTRY[args.task].add_args(parser)
 
     # Parse a second time.
-    args = parser.parse_args(input_args)
+    if parse_known:
+        args, extra = parser.parse_known_args(input_args)
+    else:
+        args = parser.parse_args(input_args)
+        extra = None
 
     # Post-process args.
     if hasattr(args, 'lr'):
@@ -104,12 +112,14 @@ def parse_args_and_arch(parser, input_args=None):
     if hasattr(args, 'arch'):
         ARCH_CONFIG_REGISTRY[args.arch](args)
 
-    return args
+    if parse_known:
+        return args, extra
+    else:
+        return args
 
 
 def get_parser(desc, default_task='translation'):
-    parser = argparse.ArgumentParser(
-        description='Facebook AI Research Sequence-to-Sequence Toolkit -- ' + desc)
+    parser = argparse.ArgumentParser()
     parser.add_argument('--no-progress-bar', action='store_true', help='disable progress bar')
     parser.add_argument('--log-interval', type=int, default=1000, metavar='N',
                         help='log progress every N batches (when progress bar is disabled)')
@@ -118,11 +128,14 @@ def get_parser(desc, default_task='translation'):
     parser.add_argument('--seed', default=1, type=int, metavar='N',
                         help='pseudo random number generator seed')
     parser.add_argument('--fp16', action='store_true', help='use FP16')
+    parser.add_argument('--fp16-init-scale', default=2**7, type=int,
+                        help='default FP16 loss scale')
 
     # Task definitions can be found under fairseq/tasks/
     parser.add_argument(
-        '--task', metavar='TASK', default=default_task, choices=TASK_REGISTRY.keys(),
-        help='task: {} (default: {})'.format(', '.join(TASK_REGISTRY.keys()), default_task)
+        '--task', metavar='TASK', default=default_task,
+        choices=TASK_REGISTRY.keys(),
+        help='task',
     )
 
     return parser
@@ -172,6 +185,15 @@ def add_distributed_training_args(parser):
                        help='port number (not required if using --distributed-init-method)')
     group.add_argument('--device-id', default=0, type=int,
                        help='which GPU to use (usually configured automatically)')
+    group.add_argument('--ddp-backend', default='c10d', type=str,
+                       choices=['c10d', 'no_c10d'],
+                       help='DistributedDataParallel backend')
+    group.add_argument('--bucket-cap-mb', default=150, type=int, metavar='MB',
+                       help='bucket size for reduction')
+    group.add_argument('--fix-batches-to-gpus', action='store_true',
+                       help='Don\'t shuffle batches between GPUs, this reduces overall '
+                            'randomness and may affect precision but avoids the cost of'
+                            're-reading the data')
     return group
 
 
@@ -192,7 +214,7 @@ def add_optimization_args(parser):
     # Optimizer definitions can be found under fairseq/optim/
     group.add_argument('--optimizer', default='nag', metavar='OPT',
                        choices=OPTIMIZER_REGISTRY.keys(),
-                       help='optimizer: {} (default: nag)'.format(', '.join(OPTIMIZER_REGISTRY.keys())))
+                       help='Optimizer')
     group.add_argument('--lr', '--learning-rate', default='0.25', metavar='LR_1,LR_2,...,LR_N',
                        help='learning rate for the first N epochs; all epochs >N using LR_N'
                             ' (note: this may be interpreted differently depending on --lr-scheduler)')
@@ -203,8 +225,8 @@ def add_optimization_args(parser):
 
     # Learning rate schedulers can be found under fairseq/optim/lr_scheduler/
     group.add_argument('--lr-scheduler', default='reduce_lr_on_plateau',
-                       help='learning rate scheduler: {} (default: reduce_lr_on_plateau)'.format(
-                           ', '.join(LR_SCHEDULER_REGISTRY.keys())))
+                       choices=LR_SCHEDULER_REGISTRY.keys(),
+                       help='Learning Rate Scheduler')
     group.add_argument('--lr-shrink', default=0.1, type=float, metavar='LS',
                        help='learning rate shrink factor for annealing, lr_new = (lr * lr_shrink)')
     group.add_argument('--min-lr', default=1e-5, type=float, metavar='LR',
@@ -221,6 +243,12 @@ def add_checkpoint_args(parser):
                        help='path to save checkpoints')
     group.add_argument('--restore-file', default='checkpoint_last.pt',
                        help='filename in save-dir from which to load checkpoint')
+    group.add_argument('--reset-optimizer', action='store_true',
+                       help='if set, does not load optimizer state from the checkpoint')
+    group.add_argument('--reset-lr-scheduler', action='store_true',
+                       help='if set, does not load lr scheduler state from the checkpoint')
+    group.add_argument('--optimizer-overrides', default="{}", type=str, metavar='DICT',
+                       help='a dictionary used to override optimizer args when loading a checkpoint')
     group.add_argument('--save-interval', type=int, default=1, metavar='N',
                        help='save a checkpoint every N epochs')
     group.add_argument('--save-interval-updates', type=int, default=0, metavar='N',
@@ -249,6 +277,10 @@ def add_common_eval_args(group):
 def add_eval_lm_args(parser):
     group = parser.add_argument_group('LM Evaluation')
     add_common_eval_args(group)
+    group.add_argument('--output-word-probs', action='store_true',
+                       help='if set, outputs words and their predicted log probabilities to standard output')
+    group.add_argument('--output-word-stats', action='store_true',
+                       help='if set, outputs word statistics such as word count, average probability, etc')
 
 
 def add_generation_args(parser):
@@ -290,6 +322,14 @@ def add_generation_args(parser):
                        help='sample from top K likely next words instead of all words')
     group.add_argument('--sampling-temperature', default=1, type=float, metavar='N',
                        help='temperature for random sampling')
+    group.add_argument('--diverse-beam-groups', default=1, type=int, metavar='N',
+                       help='number of groups for Diverse Beam Search')
+    group.add_argument('--diverse-beam-strength', default=0.5, type=float, metavar='N',
+                       help='strength of diversity penalty for Diverse Beam Search')
+    group.add_argument('--print-alignment', action='store_true',
+                       help='if set, uses attention feedback to compute and print alignment to source tokens')
+    group.add_argument('--model-overrides', default="{}", type=str, metavar='DICT',
+                       help='a dictionary used to override model args at generation that were used during model training')
     return group
 
 
@@ -312,16 +352,14 @@ def add_model_args(parser):
     group.add_argument(
         '--arch', '-a', default='fconv', metavar='ARCH', required=True,
         choices=ARCH_MODEL_REGISTRY.keys(),
-        help='model architecture: {} (default: fconv)'.format(
-            ', '.join(ARCH_MODEL_REGISTRY.keys())),
+        help='Model Architecture',
     )
 
     # Criterion definitions can be found under fairseq/criterions/
     group.add_argument(
         '--criterion', default='cross_entropy', metavar='CRIT',
         choices=CRITERION_REGISTRY.keys(),
-        help='training criterion: {} (default: cross_entropy)'.format(
-            ', '.join(CRITERION_REGISTRY.keys())),
+        help='Training Criterion',
     )
 
     return group

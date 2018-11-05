@@ -46,7 +46,7 @@ def save_state(filename, args, model, criterion, optimizer, lr_scheduler,
         extra_state = {}
     state_dict = {
         'args': args,
-        'model': convert_state_dict_type(model.state_dict()),
+        'model': model.state_dict() if model else {},
         'optimizer_history': optim_history + [
             {
                 'criterion_name': criterion.__class__.__name__,
@@ -146,17 +146,20 @@ def load_ensemble_for_inference(filenames, task, model_arg_overrides=None):
         state = torch.load(filename, map_location=lambda s, l: default_restore_location(s, 'cpu'))
         state = _upgrade_state_dict(state)
         states.append(state)
-    args = states[0]['args']
-    if model_arg_overrides is not None:
-        args = _override_model_args(args, model_arg_overrides)
 
-    # build ensemble
     ensemble = []
     for state in states:
+        args = state['args']
+
+        if model_arg_overrides is not None:
+            args = _override_model_args(args, model_arg_overrides)
+
+        # build model for ensemble
         model = task.build_model(args)
         model.upgrade_state_dict(state['model'])
         model.load_state_dict(state['model'], strict=True)
         ensemble.append(model)
+
     return ensemble, args
 
 
@@ -295,7 +298,7 @@ def post_process_prediction(hypo_tokens, src_str, alignment, align_dict, tgt_dic
     return hypo_tokens, hypo_str, alignment
 
 
-def make_positions(tensor, padding_idx, left_pad):
+def make_positions(tensor, padding_idx, left_pad, onnx_trace=False):
     """Replace non-padding symbols with their position numbers.
 
     Position numbers begin at padding_idx+1.
@@ -303,6 +306,14 @@ def make_positions(tensor, padding_idx, left_pad):
     Padding symbols are ignored, but it is necessary to specify whether padding
     is added on the left side (left_pad=True) or right side (left_pad=False).
     """
+    if onnx_trace:
+        range_buf = torch._dim_arange(like=tensor, dim=1) + padding_idx + 1
+        mask = tensor.ne(padding_idx)
+        positions = range_buf.expand_as(tensor)
+        if left_pad:
+            positions = positions - mask.size(1) + mask.long().sum(dim=1).unsqueeze(1)
+        return positions * mask.long() + padding_idx * (1 - mask.long())
+
     max_pos = padding_idx + 1 + tensor.size(1)
     if not hasattr(make_positions, 'range_buf'):
         make_positions.range_buf = tensor.new()
@@ -388,3 +399,29 @@ def checkpoint_paths(path, pattern=r'checkpoint(\d+)\.pt'):
             idx = int(m.group(1)) if len(m.groups()) > 0 else i
             entries.append((idx, m.group(0)))
     return [os.path.join(path, x[1]) for x in sorted(entries, reverse=True)]
+
+
+def resolve_max_positions(*args):
+    """Resolve max position constraints from multiple sources."""
+
+    def nullsafe_min(l):
+        minim = None
+        for item in l:
+            if minim is None:
+                minim = item
+            elif item is not None and item < minim:
+                minim = item
+        return minim
+
+    max_positions = None
+    for arg in args:
+        if max_positions is None:
+            max_positions = arg
+        elif arg is not None:
+            if isinstance(arg, float) or isinstance(arg, int):
+                max_positions = min(max_positions, arg)
+            else:
+                max_positions = tuple(
+                    map(nullsafe_min, zip(max_positions, arg))
+                )
+    return max_positions

@@ -6,6 +6,7 @@
 # can be found in the PATENTS file in the same directory.
 
 
+import torch
 import torch.nn.functional as F
 from torch import nn
 
@@ -22,31 +23,50 @@ class AdaptiveSoftmax(nn.Module):
 
         if vocab_size > cutoff[-1]:
             cutoff = cutoff + [vocab_size]
+        else:
+            assert vocab_size == cutoff[
+                -1], 'cannot specify cutoff larger than vocab size'
 
         output_dim = cutoff[0] + len(cutoff) - 1
 
         self.vocab_size = vocab_size
         self.cutoff = cutoff
         self.dropout = dropout
+        self.input_dim = input_dim
 
         self.lsm = nn.LogSoftmax(dim=1)
         self.head = nn.Linear(input_dim, output_dim, bias=False)
-        self.tail = nn.ModuleList()
-
-        for i in range(len(cutoff) - 1):
-            self.tail.append(
-                nn.Sequential(
-                    nn.Linear(input_dim, input_dim // 4 ** i, bias=False),
-                    nn.Dropout(dropout),
-                    nn.Linear(input_dim // 4 ** i, cutoff[i + 1] - cutoff[i], bias=False)
-                )
-            )
+        self._make_tail(True)
 
         def init_weights(m):
             if hasattr(m, 'weight'):
                 nn.init.xavier_uniform_(m.weight)
 
         self.apply(init_weights)
+
+        self.register_buffer('version', torch.LongTensor([1]))
+        # versions prior to 1 had a bug that offset indices on the head by 1
+        self.buggy_offset = 0
+
+    def _make_tail(self, fix_exponent):
+        extra_denom = 1 if fix_exponent else 0
+
+        self.tail = nn.ModuleList()
+        for i in range(len(self.cutoff) - 1):
+            self.tail.append(
+                nn.Sequential(
+                    nn.Linear(self.input_dim, self.input_dim // 4 ** (i + extra_denom), bias=False),
+                    nn.Dropout(self.dropout),
+                    nn.Linear(self.input_dim // 4 ** (i + extra_denom), self.cutoff[i + 1] - self.cutoff[i], bias=False)
+                )
+            )
+
+    def upgrade_state_dict_named(self, state_dict, name):
+        version_name = name + '.version'
+        if version_name not in state_dict:
+            self.buggy_offset = 1
+            self._make_tail(False)
+            state_dict[version_name] = torch.LongTensor([1])
 
     def adapt_target(self, target):
         """
@@ -62,7 +82,7 @@ class AdaptiveSoftmax(nn.Module):
 
         for i in range(len(self.cutoff) - 1):
             mask = target.ge(self.cutoff[i]).mul(target.lt(self.cutoff[i + 1]))
-            new_target[0][mask] = self.cutoff[0] + i - 1
+            new_target[0][mask] = self.cutoff[0] + i - self.buggy_offset
 
             if mask.any():
                 target_idxs.append(mask.nonzero().squeeze(1))
@@ -115,7 +135,7 @@ class AdaptiveSoftmax(nn.Module):
 
         head_sz = self.cutoff[0] + len(self.tail)
         log_probs[:, :head_sz] = self.lsm(head_y)
-        tail_priors = log_probs[:, self.cutoff[0] - 1: head_sz - 1].clone()
+        tail_priors = log_probs[:, self.cutoff[0] - self.buggy_offset: head_sz - self.buggy_offset].clone()
 
         for i in range(len(self.tail)):
             start = self.cutoff[i]
