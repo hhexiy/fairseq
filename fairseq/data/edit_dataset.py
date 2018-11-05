@@ -11,9 +11,8 @@ class EditDatasetSrcWrapper(object):
 
     def __getitem__(self, index):
         return {
-                'deleted': self.ds[index * 3 + 0],
-                'related': self.ds[index * 3 + 1],
-                'template': self.ds[index * 3 + 2],
+                'deleted': self.ds[index * 2 + 0],
+                'template': self.ds[index * 2 + 2],
                 }
 
     def __len__(self):
@@ -76,6 +75,10 @@ def collate(samples, pad_idx, eos_idx, left_pad_source=True, left_pad_target=Fal
 
 
 class EditDataset(LanguagePairDataset):
+    SOI = '<i>'
+    EOI = '</i>'
+    PLACEHOLDER = '<placeholder>'
+
     def __init__(
         self, src, src_sizes, src_dict,
         tgt=None, tgt_sizes=None, tgt_dict=None,
@@ -93,6 +96,13 @@ class EditDataset(LanguagePairDataset):
             )
         self.insert = insert
         self.combine = combine
+        self.placeholder_index = self.src_dict.index(self.PLACEHOLDER)
+
+    def insert_id(self, a):
+        for i, v in enumerate(a):
+            if v == self.self.placeholder_index:
+                return i
+        raise Exception('Cannot find placeholder.')
 
     def __getitem__(self, index):
         item = {
@@ -102,11 +112,17 @@ class EditDataset(LanguagePairDataset):
         }
         if self.insert == 'deleted':
             item['source-insert'] = self.src[index]['deleted']
-        elif self.insert == 'related':
-            item['source-insert'] = self.src[index]['related']
         if self.combine == 'token' and self.insert != 'none':
+            id_ = self.insert_id(item['source-template'])
             # TODO: use different seperator
-            template = torch.cat((item['source-template'], item['source-insert'], torch.LongTensor([self.src_dict.eos()])), dim=0)
+            #template = torch.cat((item['source-template'], item['source-insert'], torch.LongTensor([self.src_dict.eos()])), dim=0)
+            template = torch.cat((
+                item['source-template'][:id_],
+                torch.LongTensor([self.src_dict.index(self.SOI)]),
+                item['source-insert'],
+                torch.LongTensor([self.src_dict.index(self.EOI)]),
+                item['source-template'][id_+1:],
+                ), dim=0)
             #print(item['source-template'])
             #print(item['source-template'].size())
             #print(item['source-insert'])
