@@ -2,7 +2,7 @@ import os
 
 from fairseq import options
 from fairseq.data import (
-    data_utils, Dictionary,
+    data_utils, EditDictionary as Dictionary,
     IndexedInMemoryDataset, IndexedRawTextDataset,
     EditDatasetSrcWrapper, EditDataset,
 )

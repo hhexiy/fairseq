@@ -4,7 +4,27 @@ import torch
 from fairseq import utils
 
 from . import data_utils, LanguagePairDataset, IndexedInMemoryDataset
+from .dictionary import Dictionary
 
+
+class EditDictionary(Dictionary):
+    def __init__(self, pad='<pad>', eos='</s>', unk='<unk>'):
+        self.unk_word, self.pad_word, self.eos_word = unk, pad, eos
+        self.soi_word, self.eoi_word = '<i>', '</i>'
+        self.placeholder_word = '<placeholder>'
+        self.symbols = []
+        self.count = []
+        self.indices = {}
+        # dictionary indexing starts at 1 for consistency with Lua
+        self.add_symbol('<Lua heritage>')
+        self.pad_index = self.add_symbol(pad)
+        self.eos_index = self.add_symbol(eos)
+        self.unk_index = self.add_symbol(unk)
+        # start/end of insertion
+        self.soi_index = self.add_symbol(self.soi_word)
+        self.eoi_index = self.add_symbol(self.eoi_word)
+        self.placeholder_index = self.add_symbol(self.placeholder_word)
+        self.nspecial = len(self.symbols)
 
 class EditDatasetSrcWrapper(object):
     def __init__(self, ds):
@@ -78,10 +98,6 @@ def collate(samples, pad_idx, eos_idx, left_pad_source=True, left_pad_target=Fal
 
 
 class EditDataset(LanguagePairDataset):
-    SOI = '<i>'
-    EOI = '</i>'
-    PLACEHOLDER = '<placeholder>'
-
     def __init__(
         self, src, src_sizes, src_dict,
         tgt=None, tgt_sizes=None, tgt_dict=None,
@@ -99,11 +115,10 @@ class EditDataset(LanguagePairDataset):
             )
         self.insert = insert
         self.combine = combine
-        self.placeholder_index = self.src_dict.index(self.PLACEHOLDER)
 
     def insert_id(self, a):
         for i, v in enumerate(a):
-            if v == self.placeholder_index:
+            if v == self.src_dict.placeholder_index:
                 return i
         raise Exception('Cannot find placeholder.')
 
@@ -121,9 +136,9 @@ class EditDataset(LanguagePairDataset):
             #template = torch.cat((item['source-template'], item['source-insert'], torch.LongTensor([self.src_dict.eos()])), dim=0)
             template = torch.cat((
                 item['source-template'][:id_],
-                torch.LongTensor([self.src_dict.index(self.SOI)]),
+                torch.LongTensor([self.src_dict.soi_index]),
                 item['source-insert'],
-                torch.LongTensor([self.src_dict.index(self.EOI)]),
+                torch.LongTensor([self.src_dict.eoi_index]),
                 item['source-template'][id_+1:],
                 ), dim=0)
             item['source-template'] = template
