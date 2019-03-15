@@ -30,8 +30,10 @@ class EditTask(FairseqTask):
                             help='max number of tokens in the source sequence')
         parser.add_argument('--max-target-positions', default=1024, type=int, metavar='N',
                             help='max number of tokens in the target sequence')
-        parser.add_argument('--insert', default='none', choices=['none', 'deleted', 'related'])
-        parser.add_argument('--combine', default='embedding', choices=['embedding', 'token'], help='how to combine the template input and the insertion input')
+        parser.add_argument('--insert', default='none', choices=['none', 'deleted'],
+                            help='none: fill in the templated by hallucination; deleted: fill in the template with a given word')
+        parser.add_argument('--combine', default='embedding', choices=['embedding', 'token'],
+                            help='how to combine the template input and the insertion input')
 
     def __init__(self, args, src_dict, tgt_dict):
         super().__init__(args)
